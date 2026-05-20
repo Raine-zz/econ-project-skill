@@ -51,43 +51,72 @@ def _agent_field(notion_property: str) -> str:
 class NotionSync:
     def __init__(self):
         self.token = NOTION_TOKEN
-        self.db_id = NOTION_DATABASE_ID
+        raw_id = (NOTION_DATABASE_ID or "").replace("-", "")
+        if len(raw_id) != 32:
+            logger.warning(
+                f"NOTION_DATABASE_ID is {len(raw_id)} chars (expected 32). "
+                f"Check you copied the correct part from the URL."
+            )
+        self.db_id = raw_id
         self.existing_keys: dict[str, str] = {}
 
-    async def load_existing(self):
+    async def validate_database(self, client: httpx.AsyncClient):
+        """Fetch database metadata to verify access + dump schema."""
+        logger.info(f"Validating Notion database: {self.db_id}")
+        resp = await client.get(
+            f"{NOTION_API_BASE}/databases/{self.db_id}"
+        )
+        if resp.status_code >= 400:
+            logger.error(
+                f"Cannot access database [{resp.status_code}]: {resp.text[:600]}"
+            )
+            return False
+        db = resp.json()
+        props = db.get("properties", {})
+        logger.info(f"Database title: {_extract_text(db.get('title', []), 'title')}")
+        logger.info(f"Database properties ({len(props)}):")
+        for name, schema in props.items():
+            logger.info(f"  {name}: {schema.get('type')}")
+        return True
+
+    async def load_existing(self, client: httpx.AsyncClient):
         """Fetch existing Notion pages and populate self.existing_keys."""
         if not self.token or not self.db_id:
             logger.warning("Missing NOTION_TOKEN or NOTION_DATABASE_ID")
             return
-        logger.info(f"Querying Notion database: {self.db_id[:6]}...")
+        logger.info(f"Querying pages from database: {self.db_id[:8]}...")
         try:
-            async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
-                cursor = None
-                while True:
-                    body: dict = {"page_size": 100}
-                    if cursor:
-                        body["start_cursor"] = cursor
+            cursor = None
+            while True:
+                body: dict = {"page_size": 100}
+                if cursor:
+                    body["start_cursor"] = cursor
                 resp = await client.post(
                     f"{NOTION_API_BASE}/databases/{self.db_id}/query",
                     json=body,
                 )
                 if resp.status_code >= 400:
                     logger.error(
-                        f"Notion query failed [{resp.status_code}]: {resp.text[:500]}"
+                        f"Notion query failed [{resp.status_code}]: {resp.text[:600]}"
                     )
-                resp.raise_for_status()
                     resp.raise_for_status()
-                    data = resp.json()
-                    for page in data.get("results", []):
-                        props = page.get("properties", {})
-                        title_text = _extract_text(props.get(NOTION_FIELD_MAP["Institution"], {}), "title")
-                        prog_text = _extract_text(props.get(NOTION_FIELD_MAP["Program"], {}), "rich_text")
-                        key = hashlib.md5(f"{title_text}|{prog_text}".encode()).hexdigest()
-                        self.existing_keys[key] = page["id"]
-                    if not data.get("has_more"):
-                        break
-                    cursor = data.get("next_cursor")
-            logger.info(f"Loaded {len(self.existing_keys)} existing pages from Notion")
+                data = resp.json()
+                for page in data.get("results", []):
+                    page_props = page.get("properties", {})
+                    title_text = _extract_text(
+                        page_props.get(NOTION_FIELD_MAP["Institution"], {}), "title"
+                    )
+                    prog_text = _extract_text(
+                        page_props.get(NOTION_FIELD_MAP["Program"], {}), "rich_text"
+                    )
+                    key = hashlib.md5(
+                        f"{title_text}|{prog_text}".encode()
+                    ).hexdigest()
+                    self.existing_keys[key] = page["id"]
+                if not data.get("has_more"):
+                    break
+                cursor = data.get("next_cursor")
+            logger.info(f"Loaded {len(self.existing_keys)} existing pages")
         except Exception:
             logger.exception("Failed to load existing Notion pages")
 
@@ -143,7 +172,9 @@ class NotionSync:
         try:
             properties = self._build_properties(record)
         except Exception:
-            logger.exception(f"_build_properties failed for {record.get('program')}")
+            logger.exception(
+                f"_build_properties failed for {record.get('program')}"
+            )
             return False
 
         try:
@@ -154,20 +185,23 @@ class NotionSync:
                 )
                 if resp.status_code >= 400:
                     logger.error(
-                        f"Notion PATCH failed [{resp.status_code}] for {record.get('program')}: "
-                        f"{resp.text[:500]}"
+                        f"Notion PATCH failed [{resp.status_code}] "
+                        f"for {record.get('program')}: {resp.text[:600]}"
                     )
                     resp.raise_for_status()
                 logger.info(f"Updated: {record.get('program')}")
             else:
                 resp = await client.post(
                     f"{NOTION_API_BASE}/pages",
-                    json={"parent": {"database_id": self.db_id}, "properties": properties},
+                    json={
+                        "parent": {"database_id": self.db_id},
+                        "properties": properties,
+                    },
                 )
                 if resp.status_code >= 400:
                     logger.error(
-                        f"Notion POST failed [{resp.status_code}] for {record.get('program')}: "
-                        f"{resp.text[:500]}"
+                        f"Notion POST failed [{resp.status_code}] "
+                        f"for {record.get('program')}: {resp.text[:600]}"
                     )
                 resp.raise_for_status()
                 page_data = resp.json()
@@ -175,15 +209,29 @@ class NotionSync:
                 logger.info(f"Created: {record.get('program')}")
             return True
         except Exception:
-            logger.exception(f"Notion upsert failed for {record.get('program')}")
+            logger.exception(
+                f"Notion upsert failed for {record.get('program')}"
+            )
             return False
 
     async def sync_all(self, records: list[dict]):
         if not records:
             return 0, 0
-        logger.info(f"Syncing {len(records)} records to Notion (db: {self.db_id[:6]}...)")
+        logger.info(
+            f"Syncing {len(records)} records to database: {self.db_id[:8]}..."
+        )
         created, updated = 0, 0
         async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
+            # 1) Validate database access + dump schema
+            ok = await self.validate_database(client)
+            if not ok:
+                logger.error("Database validation failed — aborting sync")
+                return 0, 0
+
+            # 2) Load existing pages for dedup
+            await self.load_existing(client)
+
+            # 3) Upsert each record
             for rec in records:
                 key = _make_key(rec)
                 existed = key in self.existing_keys

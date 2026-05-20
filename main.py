@@ -93,7 +93,6 @@ async def notion_sync(records):
     from utils.notion_helper import NotionSync
     logger.info("=== Stage 3: Notion sync ===")
     sync = NotionSync()
-    await sync.load_existing()
     created, updated = await sync.sync_all(records)
     logger.info(f"Notion sync complete: {created} created, {updated} updated")
     return {"created": created, "updated": updated}
