@@ -85,7 +85,6 @@ def notion_sync(records):
         logger.warning("No records to sync — skipping Notion stage")
         return {}
 
-    from notion_client import Client
     import os
     if not os.getenv("NOTION_TOKEN") or not os.getenv("NOTION_DATABASE_ID"):
         logger.warning("NOTION_TOKEN or NOTION_DATABASE_ID not set — skipping Notion sync")
@@ -94,6 +93,7 @@ def notion_sync(records):
     from utils.notion_helper import NotionSync
     logger.info("=== Stage 3: Notion sync ===")
     sync = NotionSync()
+    sync._load_existing()
     created, updated = sync.sync_all(records)
     logger.info(f"Notion sync complete: {created} created, {updated} updated")
     return {"created": created, "updated": updated}
