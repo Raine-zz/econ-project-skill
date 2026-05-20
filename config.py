@@ -79,12 +79,12 @@ PRIORITY_SCHOOLS: list[dict] = [
 # =============================================================================
 SEED_URLS: list[dict] = [
     # -- UK --
-    {"school": "LSE", "url": "https://www.lse.ac.uk/economics/graduate/programmes"},
-    {"school": "University of Oxford", "url": "https://www.ox.ac.uk/admissions/graduate/courses/economics"},
-    {"school": "University of Cambridge", "url": "https://www.postgraduate.study.cam.ac.uk/courses/departments/acec"},
+    {"school": "LSE", "url": "https://www.lse.ac.uk/study-at-lse/Graduate/available-programmes"},
+    {"school": "University of Oxford", "url": "https://www.economics.ox.ac.uk/graduate"},
+    {"school": "University of Cambridge", "url": "https://www.econ.cam.ac.uk/"},
 
     # -- Europe --
-    {"school": "Toulouse School of Economics", "url": "https://www.tse-fr.eu/admission-masters"},
+    {"school": "Toulouse School of Economics", "url": "https://www.tse-fr.eu/master-in-economics"},
     {"school": "Paris School of Economics", "url": "https://www.parisschoolofeconomics.eu/en/teaching/masters-programmes/"},
     {"school": "Bocconi University", "url": "https://www.unibocconi.eu/economics-and-social-sciences"},
     {"school": "Bonn Graduate School of Economics", "url": "https://www.bgse.uni-bonn.de/master"},
