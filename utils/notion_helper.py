@@ -73,7 +73,10 @@ class NotionSync:
             return False
         db = resp.json()
         props = db.get("properties", {})
-        logger.info(f"Database title: {_extract_text(db.get('title', []), 'title')}")
+        db_title = "".join(
+            t.get("plain_text", "") for t in (db.get("title") or [])
+        )
+        logger.info(f"Database title: {db_title}")
         logger.info(f"Database properties ({len(props)}):")
         for name, schema in props.items():
             logger.info(f"  {name}: {schema.get('type')}")
