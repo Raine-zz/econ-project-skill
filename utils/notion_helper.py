@@ -59,6 +59,7 @@ class NotionSync:
         if not self.token or not self.db_id:
             logger.warning("Missing NOTION_TOKEN or NOTION_DATABASE_ID")
             return
+        logger.info(f"Querying Notion database: {self.db_id[:6]}...")
         try:
             async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
                 cursor = None
@@ -66,10 +67,15 @@ class NotionSync:
                     body: dict = {"page_size": 100}
                     if cursor:
                         body["start_cursor"] = cursor
-                    resp = await client.post(
-                        f"{NOTION_API_BASE}/databases/{self.db_id}/query",
-                        json=body,
+                resp = await client.post(
+                    f"{NOTION_API_BASE}/databases/{self.db_id}/query",
+                    json=body,
+                )
+                if resp.status_code >= 400:
+                    logger.error(
+                        f"Notion query failed [{resp.status_code}]: {resp.text[:500]}"
                     )
+                resp.raise_for_status()
                     resp.raise_for_status()
                     data = resp.json()
                     for page in data.get("results", []):
@@ -81,6 +87,7 @@ class NotionSync:
                     if not data.get("has_more"):
                         break
                     cursor = data.get("next_cursor")
+            logger.info(f"Loaded {len(self.existing_keys)} existing pages from Notion")
         except Exception:
             logger.exception("Failed to load existing Notion pages")
 
@@ -141,20 +148,31 @@ class NotionSync:
 
         try:
             if key in self.existing_keys:
-                await client.patch(
+                resp = await client.patch(
                     f"{NOTION_API_BASE}/pages/{self.existing_keys[key]}",
                     json={"properties": properties},
                 )
-                logger.debug(f"Updated: {record.get('program')}")
+                if resp.status_code >= 400:
+                    logger.error(
+                        f"Notion PATCH failed [{resp.status_code}] for {record.get('program')}: "
+                        f"{resp.text[:500]}"
+                    )
+                    resp.raise_for_status()
+                logger.info(f"Updated: {record.get('program')}")
             else:
                 resp = await client.post(
                     f"{NOTION_API_BASE}/pages",
                     json={"parent": {"database_id": self.db_id}, "properties": properties},
                 )
+                if resp.status_code >= 400:
+                    logger.error(
+                        f"Notion POST failed [{resp.status_code}] for {record.get('program')}: "
+                        f"{resp.text[:500]}"
+                    )
                 resp.raise_for_status()
                 page_data = resp.json()
                 self.existing_keys[key] = page_data["id"]
-                logger.debug(f"Created: {record.get('program')}")
+                logger.info(f"Created: {record.get('program')}")
             return True
         except Exception:
             logger.exception(f"Notion upsert failed for {record.get('program')}")
@@ -163,6 +181,7 @@ class NotionSync:
     async def sync_all(self, records: list[dict]):
         if not records:
             return 0, 0
+        logger.info(f"Syncing {len(records)} records to Notion (db: {self.db_id[:6]}...)")
         created, updated = 0, 0
         async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
             for rec in records:
