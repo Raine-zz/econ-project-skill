@@ -1,0 +1,26 @@
+# Environment variables (sensitive)
+.env
+
+# Logs
+logs/
+
+# Data output (fetched HTML / agent JSON)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
