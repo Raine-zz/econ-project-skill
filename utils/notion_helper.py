@@ -1,9 +1,8 @@
 """
 Notion helper — upsert programme records via the Notion HTTP API (httpx).
-Avoids notion-client library version issues by calling the REST API directly.
+All network calls are async; callers must be inside an async event loop.
 """
 
-import asyncio
 import logging
 import hashlib
 
@@ -21,11 +20,13 @@ logger = logging.getLogger(__name__)
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
-HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Notion-Version": NOTION_VERSION,
-    "Content-Type": "application/json",
-}
+
+def _headers() -> dict:
+    return {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
 
 
 def _make_key(record: dict) -> str:
@@ -53,57 +54,46 @@ class NotionSync:
         self.db_id = NOTION_DATABASE_ID
         self.existing_keys: dict[str, str] = {}
 
-    # ------------------------------------------------------------------
-    #  Load existing pages (run synchronously inside __init__ via
-    #  asyncio.run() so the class can be instantiated easily)
-    # ------------------------------------------------------------------
-    def _load_existing(self):
+    async def load_existing(self):
+        """Fetch existing Notion pages and populate self.existing_keys."""
         if not self.token or not self.db_id:
             logger.warning("Missing NOTION_TOKEN or NOTION_DATABASE_ID")
             return
         try:
-            asyncio.run(self._load_existing_async())
+            async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
+                cursor = None
+                while True:
+                    body: dict = {"page_size": 100}
+                    if cursor:
+                        body["start_cursor"] = cursor
+                    resp = await client.post(
+                        f"{NOTION_API_BASE}/databases/{self.db_id}/query",
+                        json=body,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    for page in data.get("results", []):
+                        props = page.get("properties", {})
+                        title_text = _extract_text(props.get(NOTION_FIELD_MAP["Institution"], {}), "title")
+                        prog_text = _extract_text(props.get(NOTION_FIELD_MAP["Program"], {}), "rich_text")
+                        key = hashlib.md5(f"{title_text}|{prog_text}".encode()).hexdigest()
+                        self.existing_keys[key] = page["id"]
+                    if not data.get("has_more"):
+                        break
+                    cursor = data.get("next_cursor")
         except Exception:
             logger.exception("Failed to load existing Notion pages")
 
-    async def _load_existing_async(self):
-        async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
-            cursor = None
-            while True:
-                body: dict = {"page_size": 100}
-                if cursor:
-                    body["start_cursor"] = cursor
-
-                resp = await client.post(
-                    f"{NOTION_API_BASE}/databases/{self.db_id}/query",
-                    json=body,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-
-                for page in data.get("results", []):
-                    props = page.get("properties", {})
-                    title_text = _extract_text(props.get(NOTION_FIELD_MAP["Institution"], {}), "title")
-                    prog_text = _extract_text(props.get(NOTION_FIELD_MAP["Program"], {}), "rich_text")
-                    key = hashlib.md5(f"{title_text}|{prog_text}".encode()).hexdigest()
-                    self.existing_keys[key] = page["id"]
-
-                if not data.get("has_more"):
-                    break
-                cursor = data.get("next_cursor")
-
-    # ------------------------------------------------------------------
-    #  Build Notion page properties from agent record
-    # ------------------------------------------------------------------
     def _build_properties(self, record: dict) -> dict:
+        """Map an agent record dict to Notion page properties."""
         props = {}
 
-        # ---- Title: Institution ----
+        # Title: Institution
         props[NOTION_FIELD_MAP["Institution"]] = {
             "title": [{"text": {"content": _safe_str(record.get("institution"))}}]
         }
 
-        # ---- Rich text fields (explicit mapping) ----
+        # Rich text fields
         rich_text_notion_fields = [
             "Program", "Website", "Requirement", "Project Link",
             "Region", "Country", "City", "Degree Type",
@@ -120,14 +110,14 @@ class NotionSync:
                 "rich_text": [{"text": {"content": value}}]
             }
 
-        # ---- Date: Due Date ----
+        # Date: Due Date
         due = record.get("due_date", "")
         if due and due != "N/A":
             props[NOTION_FIELD_MAP["Due Date"]] = {"date": {"start": due}}
         else:
             props[NOTION_FIELD_MAP["Due Date"]] = {"date": None}
 
-        # ---- Numbers ----
+        # Numbers
         props[NOTION_FIELD_MAP["Days to Prepare"]] = {
             "number": int(record.get("days_to_prepare", 0) or 0)
         }
@@ -135,16 +125,13 @@ class NotionSync:
             "number": int(record.get("importance", 5) or 5)
         }
 
-        # ---- Select: School ----
+        # Select: School
         school_val = record.get("school") or record.get("institution", "")
         props["School"] = {"select": {"name": _safe_str(school_val)}}
 
         return props
 
-    # ------------------------------------------------------------------
-    #  Upsert a single record
-    # ------------------------------------------------------------------
-    async def upsert_async(self, client: httpx.AsyncClient, record: dict):
+    async def _upsert_one(self, client: httpx.AsyncClient, record: dict):
         key = _make_key(record)
         try:
             properties = self._build_properties(record)
@@ -173,37 +160,25 @@ class NotionSync:
             logger.exception(f"Notion upsert failed for {record.get('program')}")
             return False
 
-    # ------------------------------------------------------------------
-    #  Sync all records
-    # ------------------------------------------------------------------
-    def sync_all(self, records: list[dict]):
+    async def sync_all(self, records: list[dict]):
         if not records:
             return 0, 0
         created, updated = 0, 0
-
-        async def _run():
-            nonlocal created, updated
-            async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
-                for rec in records:
-                    key = _make_key(rec)
-                    existed = key in self.existing_keys
-                    ok = await self.upsert_async(client, rec)
-                    if ok:
-                        if existed:
-                            updated += 1
-                        else:
-                            created += 1
-
-        asyncio.run(_run())
+        async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
+            for rec in records:
+                key = _make_key(rec)
+                existed = key in self.existing_keys
+                ok = await self._upsert_one(client, rec)
+                if ok:
+                    if existed:
+                        updated += 1
+                    else:
+                        created += 1
         logger.info(f"Notion sync done: {created} created, {updated} updated")
         return created, updated
 
 
-# -------------------------------------------------------------------
-#  Helpers
-# -------------------------------------------------------------------
 def _extract_text(prop_obj: dict, prop_type: str) -> str:
-    """Extract plain text from a Notion property object (title / rich_text)."""
     if not prop_obj:
         return ""
     items = prop_obj.get(prop_type, [])

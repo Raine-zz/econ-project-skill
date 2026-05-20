@@ -79,7 +79,7 @@ async def agent_analyse(pages):
     return records
 
 
-def notion_sync(records):
+async def notion_sync(records):
     """Stage 3: upsert all records into Notion database."""
     if not records:
         logger.warning("No records to sync — skipping Notion stage")
@@ -93,8 +93,8 @@ def notion_sync(records):
     from utils.notion_helper import NotionSync
     logger.info("=== Stage 3: Notion sync ===")
     sync = NotionSync()
-    sync._load_existing()
-    created, updated = sync.sync_all(records)
+    await sync.load_existing()
+    created, updated = await sync.sync_all(records)
     logger.info(f"Notion sync complete: {created} created, {updated} updated")
     return {"created": created, "updated": updated}
 
@@ -133,7 +133,7 @@ async def main():
 
         # 3. Notion sync
         if records:
-            notion_sync(records)
+            await notion_sync(records)
 
         # 4. Slack notify
         if records:
