@@ -78,7 +78,8 @@ def _prop_value(schema_type: str, raw_value) -> dict | None:
     if schema_type == "select":
         if is_empty:
             return None
-        return {"select": {"name": s}}
+        name = s.replace(",", " -")
+        return {"select": {"name": name}}
 
     # ── number: omit if empty ──
     if schema_type == "number":
