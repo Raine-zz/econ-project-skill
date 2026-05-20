@@ -1,6 +1,12 @@
 """
 Notion helper — upsert programme records via the Notion HTTP API (httpx).
 All network calls are async; callers must be inside an async event loop.
+
+Key design:
+- validate_database() reads the live schema and stores it as self.db_schema
+- _build_properties() uses the live schema to emit the correct property
+  structure for every field (title / rich_text / select / url / number / date)
+- Fields that do not exist in the database are silently skipped
 """
 
 import logging
@@ -11,7 +17,6 @@ import httpx
 from config import (
     NOTION_TOKEN,
     NOTION_DATABASE_ID,
-    NOTION_FIELD_MAP,
     AGENT_TO_NOTION_FIELD,
 )
 
@@ -48,6 +53,56 @@ def _agent_field(notion_property: str) -> str:
     return notion_property.lower().replace(" ", "_")
 
 
+def _prop_value(schema_type: str, raw_value) -> dict | None:
+    """Build a Notion property value object for a given schema type.
+
+    Returns *real* None (not a dict with null) when there is no valid value,
+    so the caller can omit the property entirely.
+    """
+    s = str(raw_value).strip() if raw_value is not None else ""
+    is_empty = not s or s.upper() == "N/A"
+
+    # ── text-ish types always send (even empty) ──
+    if schema_type == "title":
+        return {"title": [{"text": {"content": _safe_str(raw_value)}}]}
+    if schema_type == "rich_text":
+        return {"rich_text": [{"text": {"content": _safe_str(raw_value)}}]}
+
+    # ── url: omit if empty ──
+    if schema_type == "url":
+        if is_empty:
+            return None
+        return {"url": s}
+
+    # ── select: omit if empty ──
+    if schema_type == "select":
+        if is_empty:
+            return None
+        return {"select": {"name": s}}
+
+    # ── number: omit if empty ──
+    if schema_type == "number":
+        if is_empty or raw_value is None:
+            return None
+        try:
+            return {"number": int(raw_value)}
+        except (ValueError, TypeError):
+            try:
+                return {"number": float(raw_value)}
+            except (ValueError, TypeError):
+                return None
+
+    # ── date: omit if empty ──
+    if schema_type == "date":
+        if is_empty:
+            return None
+        return {"date": {"start": s}}
+
+    # ── fallback ──
+    logger.debug(f"Unhandled schema type '{schema_type}', using rich_text")
+    return {"rich_text": [{"text": {"content": _safe_str(raw_value)}}]}
+
+
 class NotionSync:
     def __init__(self):
         self.token = NOTION_TOKEN
@@ -59,9 +114,13 @@ class NotionSync:
             )
         self.db_id = raw_id
         self.existing_keys: dict[str, str] = {}
+        self.db_schema: dict[str, str] = {}         # property-name → type
+        self.title_column: str = "Institution"       # will be detected
+
+    # ── Database validation & schema loading ──────────────────────────
 
     async def validate_database(self, client: httpx.AsyncClient):
-        """Fetch database metadata to verify access + dump schema."""
+        """Fetch database metadata and populate self.db_schema."""
         logger.info(f"Validating Notion database: {self.db_id}")
         resp = await client.get(
             f"{NOTION_API_BASE}/databases/{self.db_id}"
@@ -71,16 +130,28 @@ class NotionSync:
                 f"Cannot access database [{resp.status_code}]: {resp.text[:600]}"
             )
             return False
+
         db = resp.json()
         props = db.get("properties", {})
+
+        # database title
         db_title = "".join(
             t.get("plain_text", "") for t in (db.get("title") or [])
         )
         logger.info(f"Database title: {db_title}")
         logger.info(f"Database properties ({len(props)}):")
+
+        self.db_schema.clear()
         for name, schema in props.items():
-            logger.info(f"  {name}: {schema.get('type')}")
+            ptype = schema.get("type", "rich_text")
+            self.db_schema[name] = ptype
+            logger.info(f"  {name}: {ptype}")
+            if ptype == "title":
+                self.title_column = name
+
         return True
+
+    # ── Existing page loading ─────────────────────────────────────────
 
     async def load_existing(self, client: httpx.AsyncClient):
         """Fetch existing Notion pages and populate self.existing_keys."""
@@ -106,12 +177,19 @@ class NotionSync:
                 data = resp.json()
                 for page in data.get("results", []):
                     page_props = page.get("properties", {})
-                    title_text = _extract_text(
-                        page_props.get(NOTION_FIELD_MAP["Institution"], {}), "title"
-                    )
-                    prog_text = _extract_text(
-                        page_props.get(NOTION_FIELD_MAP["Program"], {}), "rich_text"
-                    )
+
+                    # extract title text
+                    title_obj = page_props.get(self.title_column, {})
+                    title_text = _extract_text(title_obj, self.db_schema.get(self.title_column, "title"))
+
+                    # extract program text (try several known columns)
+                    prog_text = ""
+                    for col in ("Program", "program", "Name"):
+                        if col in page_props:
+                            prog_text = _extract_text(page_props[col], self.db_schema.get(col, "rich_text"))
+                            if prog_text:
+                                break
+
                     key = hashlib.md5(
                         f"{title_text}|{prog_text}".encode()
                     ).hexdigest()
@@ -123,52 +201,38 @@ class NotionSync:
         except Exception:
             logger.exception("Failed to load existing Notion pages")
 
+    # ── Properties builder (schema-aware) ─────────────────────────────
+
     def _build_properties(self, record: dict) -> dict:
-        """Map an agent record dict to Notion page properties."""
-        props = {}
+        """Build a properties dict that exactly matches the live database schema."""
+        props: dict = {}
 
-        # Title: Institution
-        props[NOTION_FIELD_MAP["Institution"]] = {
-            "title": [{"text": {"content": _safe_str(record.get("institution"))}}]
-        }
+        for notion_name, schema_type in self.db_schema.items():
+            # Find the agent field that corresponds to this Notion column
+            agent_key = _agent_field(notion_name)
 
-        # Rich text fields
-        rich_text_notion_fields = [
-            "Program", "Website", "Requirement", "Project Link",
-            "Region", "Country", "City", "Degree Type",
-            "Orientation", "Preference", "Process",
-            "Application Deadline", "Admission", "Study Period",
-            "Tuition", "Language", "IELTS", "GRE", "GPA", "CV",
-            "Core Requirements", "Field", "Notes", "Interview", "Summary",
-        ]
-        for notion_field in rich_text_notion_fields:
-            notion_key = NOTION_FIELD_MAP.get(notion_field, notion_field)
-            agent_key = _agent_field(notion_field)
-            value = _safe_str(record.get(agent_key, ""))
-            props[notion_key] = {
-                "rich_text": [{"text": {"content": value}}]
-            }
+            # Handle special cases that need different lookup logic
+            if notion_name == self.title_column:
+                raw_value = record.get("institution", record.get("institution", ""))
+            elif notion_name == "School":
+                raw_value = record.get("school") or record.get("institution", "")
+            elif notion_name == "Due Date":
+                raw_value = record.get("due_date", "")
+            elif agent_key == "importance":
+                raw_value = record.get("importance", 5)
+            elif agent_key == "days_to_prepare":
+                raw_value = record.get("days_to_prepare", 0)
+            else:
+                raw_value = record.get(agent_key, "")
 
-        # Date: Due Date
-        due = record.get("due_date", "")
-        if due and due != "N/A":
-            props[NOTION_FIELD_MAP["Due Date"]] = {"date": {"start": due}}
-        else:
-            props[NOTION_FIELD_MAP["Due Date"]] = {"date": None}
-
-        # Numbers
-        props[NOTION_FIELD_MAP["Days to Prepare"]] = {
-            "number": int(record.get("days_to_prepare", 0) or 0)
-        }
-        props[NOTION_FIELD_MAP["Importance"]] = {
-            "number": int(record.get("importance", 5) or 5)
-        }
-
-        # Select: School
-        school_val = record.get("school") or record.get("institution", "")
-        props["School"] = {"select": {"name": _safe_str(school_val)}}
+            # Build the structured value
+            value = _prop_value(schema_type, raw_value)
+            if value is not None:
+                props[notion_name] = value
 
         return props
+
+    # ── Upsert ────────────────────────────────────────────────────────
 
     async def _upsert_one(self, client: httpx.AsyncClient, record: dict):
         key = _make_key(record)
@@ -217,6 +281,8 @@ class NotionSync:
             )
             return False
 
+    # ── Sync all ──────────────────────────────────────────────────────
+
     async def sync_all(self, records: list[dict]):
         if not records:
             return 0, 0
@@ -225,7 +291,7 @@ class NotionSync:
         )
         created, updated = 0, 0
         async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
-            # 1) Validate database access + dump schema
+            # 1) Validate database access + load schema
             ok = await self.validate_database(client)
             if not ok:
                 logger.error("Database validation failed — aborting sync")
@@ -248,8 +314,15 @@ class NotionSync:
         return created, updated
 
 
+# ── Utility ───────────────────────────────────────────────────────────
+
 def _extract_text(prop_obj: dict, prop_type: str) -> str:
+    """Extract plain text from a Notion property or plain rich-text array."""
     if not prop_obj:
         return ""
+    # Handle list format (array of {plain_text, ...})
+    if isinstance(prop_obj, list):
+        return "".join(t.get("plain_text", "") for t in prop_obj)
+    # Handle property wrapper format
     items = prop_obj.get(prop_type, [])
     return "".join(t.get("plain_text", "") for t in items)
