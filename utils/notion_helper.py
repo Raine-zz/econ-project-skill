@@ -314,6 +314,61 @@ class NotionSync:
         logger.info(f"Notion sync done: {created} created, {updated} updated")
         return created, updated
 
+    # ── Query (for Slack Bot) ─────────────────────────────────────────
+
+    async def query(self, filters: dict) -> list[dict]:
+        """
+        Query the Notion database with optional filters.
+        Returns list of programme dicts (agent-output shape).
+        """
+        if not self.token or not self.db_id:
+            return []
+
+        notion_filter = _build_notion_filter(filters)
+
+        async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
+            results: list[dict] = []
+            cursor = None
+            while True:
+                body: dict = {"page_size": 100}
+                if cursor:
+                    body["start_cursor"] = cursor
+                if notion_filter:
+                    body["filter"] = notion_filter
+
+                resp = await client.post(
+                    f"{NOTION_API_BASE}/databases/{self.db_id}/query",
+                    json=body,
+                )
+                if resp.status_code >= 400:
+                    logger.error(f"Query failed [{resp.status_code}]: {resp.text[:400]}")
+                    break
+                data = resp.json()
+
+                for page in data.get("results", []):
+                    rec = _props_to_record(page.get("properties", {}))
+                    if rec:
+                        results.append(rec)
+
+                if not data.get("has_more"):
+                    break
+                cursor = data.get("next_cursor")
+
+        # In-memory filtering for fields Notion can't filter
+        if "keyword" in filters and filters["keyword"]:
+            kw = filters["keyword"].lower()
+            results = [r for r in results if kw in json.dumps(r).lower()]
+
+        if "deadline_before" in filters:
+            dl = filters["deadline_before"]
+            results = [r for r in results if r.get("due_date", "N/A") <= dl]
+
+        if "importance_min" in filters:
+            im = int(filters["importance_min"])
+            results = [r for r in results if int(r.get("importance", 0)) >= im]
+
+        return results
+
 
 # ── Utility ───────────────────────────────────────────────────────────
 
@@ -321,9 +376,76 @@ def _extract_text(prop_obj: dict, prop_type: str) -> str:
     """Extract plain text from a Notion property or plain rich-text array."""
     if not prop_obj:
         return ""
-    # Handle list format (array of {plain_text, ...})
     if isinstance(prop_obj, list):
         return "".join(t.get("plain_text", "") for t in prop_obj)
-    # Handle property wrapper format
     items = prop_obj.get(prop_type, [])
     return "".join(t.get("plain_text", "") for t in items)
+
+
+def _build_notion_filter(filters: dict) -> dict | None:
+    """Build a Notion API filter object from user-friendly filters."""
+    conditions = []
+
+    if "institution" in filters and filters["institution"]:
+        conditions.append({
+            "property": "Institution",
+            "title": {"contains": filters["institution"]},
+        })
+
+    for field in ("country", "region", "degree_type"):
+        val = filters.get(field)
+        if val:
+            # Map to correct Notion property name
+            prop_name = {"country": "Country", "region": "Region", "degree_type": "Degree Type"}.get(field, field)
+            conditions.append({"property": prop_name, "select": {"equals": val}})
+
+    if "importance_min" in filters:
+        conditions.append({
+            "property": "Importance",
+            "number": {"greater_than_or_equal_to": int(filters["importance_min"])},
+        })
+
+    if "deadline_before" in filters:
+        dl = filters["deadline_before"]
+        if dl and dl != "N/A":
+            conditions.append({
+                "property": "Due Date",
+                "date": {"on_or_before": dl},
+            })
+
+    if not conditions:
+        return None
+    if len(conditions) == 1:
+        return conditions[0]
+    return {"and": conditions}
+
+
+def _props_to_record(props: dict) -> dict | None:
+    """Convert a Notion page properties dict back to an agent-style record."""
+    title_text = _extract_text(props.get("Institution", props.get("Name", {})), "title")
+    if not title_text.strip():
+        return None
+    return {
+        "institution": title_text,
+        "program": _extract_text(props.get("Program", {}), "rich_text"),
+        "website": _extract_text(props.get("Website", {}), "rich_text"),
+        "region": _extract_text(props.get("Region", {}), "rich_text"),
+        "country": _extract_text(props.get("Country", {}), "rich_text"),
+        "city": _extract_text(props.get("City", {}), "rich_text"),
+        "degree_type": _extract_text(props.get("Degree Type", {}), "rich_text"),
+        "orientation": _extract_text(props.get("Orientation", {}), "rich_text"),
+        "process": _extract_text(props.get("Process", {}), "rich_text"),
+        "due_date": _extract_text(props.get("Due Date", {}), "rich_text"),
+        "admission": _extract_text(props.get("Admission", {}), "rich_text"),
+        "study_period": _extract_text(props.get("Study Period", {}), "rich_text"),
+        "tuition": _extract_text(props.get("Tuition", {}), "rich_text"),
+        "language_of_instruction": _extract_text(props.get("Language", {}), "rich_text"),
+        "ielts_requirement": _extract_text(props.get("IELTS", {}), "rich_text"),
+        "gre_requirement": _extract_text(props.get("GRE", {}), "rich_text"),
+        "gpa_requirement": _extract_text(props.get("GPA", {}), "rich_text"),
+        "core_requirements": _extract_text(props.get("Core Requirements", {}), "rich_text"),
+        "field": _extract_text(props.get("Field", {}), "rich_text"),
+        "notes": _extract_text(props.get("Notes", {}), "rich_text"),
+        "importance": int(_extract_text(props.get("Importance", {}), "rich_text") or 0),
+        "summary": _extract_text(props.get("Summary", {}), "rich_text"),
+    }
