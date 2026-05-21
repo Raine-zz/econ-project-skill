@@ -2,12 +2,17 @@
 Webpage fetcher — downloads HTML from seed URLs and follows on-domain links
 up to MAX_DEPTH.  Uses httpx for async HTTP.
 
-When a seed URL fails (404/403) or yields zero relevant pages, the fetcher
-automatically attempts URL discovery to find the correct programme page.
+Self-healing URL discovery:
+  - If a seed URL yields 0 relevant pages, automatically attempts URL discovery.
+  - Discovered URLs are persisted to data/discovered_urls.json.
+  - On the next run they replace the original seed URLs for those schools.
+  - GitHub Actions cache carries discovered_urls.json across runs.
 """
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from typing import Optional
 
@@ -23,9 +28,47 @@ from utils.url_discovery import discover_programme_urls
 
 logger = logging.getLogger(__name__)
 
+DISCOVERED_FILE = Path(__file__).resolve().parent.parent / "data" / "discovered_urls.json"
+
+
+def _load_discovered_urls() -> dict[str, str]:
+    """Load previously discovered URLs from disk. {school_name: url}."""
+    if not DISCOVERED_FILE.exists():
+        return {}
+    try:
+        data = json.loads(DISCOVERED_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if isinstance(v, str) and v.startswith("http")}
+    except Exception:
+        logger.warning("Failed to load discovered_urls.json")
+    return {}
+
+
+def _save_discovered_urls(discovered: dict[str, str]):
+    """Persist the current discovered URLs map to disk."""
+    DISCOVERED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DISCOVERED_FILE.write_text(
+        json.dumps(discovered, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _build_effective_seeds(discovered: dict[str, str]) -> list[dict]:
+    """
+    Merge SEED_URLS with discovered URLs. Discovered take priority.
+    """
+    effective = []
+    for seed in SEED_URLS:
+        if seed["school"] in discovered:
+            d_url = discovered[seed["school"]]
+            if d_url != seed["url"]:
+                logger.info(f"  Using discovered URL for {seed['school']}: {d_url}")
+            effective.append({"school": seed["school"], "url": d_url})
+        else:
+            effective.append(seed)
+    return effective
+
 
 async def _fetch_page(client: httpx.AsyncClient, url: str) -> Optional[str]:
-    """Fetch a single page, return HTML text or None on failure."""
     try:
         resp = await client.get(url, timeout=REQUEST_TIMEOUT, follow_redirects=True)
         resp.raise_for_status()
@@ -38,7 +81,6 @@ async def _fetch_page(client: httpx.AsyncClient, url: str) -> Optional[str]:
 
 
 def _extract_on_domain_links(base_url: str, html: str) -> list[str]:
-    """Return absolute URLs that share the same domain as base_url."""
     if not html:
         return []
     base_domain = urlparse(base_url).netloc
@@ -56,9 +98,6 @@ async def _crawl_from_seed(
     seed_url: str,
     school_name: str,
 ) -> tuple[list[dict], set[str]]:
-    """
-    BFS crawl from a given URL. Returns (pages, visited_urls).
-    """
     visited: set[str] = set()
     pages: list[dict] = []
     queue: list[tuple[str, int]] = [(seed_url, 0)]
@@ -75,7 +114,6 @@ async def _crawl_from_seed(
 
         if is_target_program(html, TARGET_KEYWORDS):
             pages.append({"url": url, "html": html})
-            logger.debug(f"  kept: {url}")
 
         if depth < MAX_DEPTH:
             for link in _extract_on_domain_links(url, html):
@@ -87,9 +125,13 @@ async def _crawl_from_seed(
 
 async def run_crawler() -> list[dict]:
     """
-    Main entry: crawl all SEED_URLS concurrently.
-    Returns [{school, url, html}, ...].
+    Main entry: crawl all schools, with self-healing URL discovery.
+    Returns [{school, url, html, source}, ...].
     """
+    # ── Load persisted discovered URLs ──
+    saved = _load_discovered_urls()
+    effective_seeds = _build_effective_seeds(saved)
+
     results: list[dict] = []
     discovery_log: list[dict] = []
 
@@ -98,55 +140,46 @@ async def run_crawler() -> list[dict]:
         timeout=REQUEST_TIMEOUT,
         follow_redirects=True,
     ) as client:
-        # ── Phase 1: crawl all seed URLs ──
-        school_results: list[tuple[str, list[dict]]] = []
-        for seed in SEED_URLS:
+        # ── Phase 1: crawl all (effective) seed URLs ──
+        school_results: list[tuple[str, list[dict], str]] = []
+        for seed in effective_seeds:
             pages, _visited = await _crawl_from_seed(
                 client, seed["url"], seed["school"]
             )
             school_results.append((seed["school"], pages, seed["url"]))
-            logger.info(
-                f"  {seed['school']}: {len(pages)} pages from seed URL"
-            )
+            logger.info(f"  {seed['school']}: {len(pages)} pages")
             for page in pages:
                 results.append({
                     "school": seed["school"],
                     "url": page["url"],
                     "html": page["html"],
-                    "source": "seed",
+                    "source": "discovered" if seed["school"] in saved else "seed",
                 })
 
         # ── Phase 2: URL discovery for schools with 0 pages ──
+        new_discoveries: dict[str, str] = {}
         for school_name, pages, seed_url in school_results:
             if pages:
-                continue  # already got results
+                continue
 
             logger.info(
-                f"  {school_name}: seed URL returned 0 relevant pages, "
-                f"attempting URL discovery..."
+                f"  {school_name}: 0 relevant pages, discovering alternative URLs..."
             )
-
             discovered = await discover_programme_urls(
                 client, seed_url, max_candidates=3
             )
-
             if not discovered:
                 logger.warning(f"  {school_name}: URL discovery found nothing")
                 continue
 
             for d in discovered:
-                logger.info(
-                    f"    discovered candidate (score={d['score']}): {d['url']}"
-                )
+                logger.info(f"    candidate (score={d['score']}): {d['url']}")
 
-            # Try the best candidate
             best = discovered[0]
             disc_pages, _disc_visited = await _crawl_from_seed(
                 client, best["url"], school_name
             )
-            logger.info(
-                f"  {school_name}: {len(disc_pages)} pages from discovered URL"
-            )
+            logger.info(f"  {school_name}: {len(disc_pages)} pages from discovered URL")
 
             for page in disc_pages:
                 results.append({
@@ -156,7 +189,10 @@ async def run_crawler() -> list[dict]:
                     "source": "discovered",
                 })
 
-            # Log all candidates for manual review
+            # Auto-accept if score >= 15 (very confident match)
+            if best["score"] >= 15 and disc_pages:
+                new_discoveries[school_name] = best["url"]
+
             discovery_log.append({
                 "school": school_name,
                 "old_url": seed_url,
@@ -166,13 +202,23 @@ async def run_crawler() -> list[dict]:
                 ],
             })
 
+    # ── Auto-persist high-confidence discoveries ──
+    if new_discoveries:
+        merged = {**saved, **new_discoveries}
+        _save_discovered_urls(merged)
+        logger.info(
+            f"Auto-saved {len(new_discoveries)} discovered URLs to discovered_urls.json"
+        )
+        for name, url in new_discoveries.items():
+            logger.info(f"  {name} → {url}")
+
     # ── Print discovery summary ──
     if discovery_log:
-        logger.info("=== URL Discovery Summary (consider updating config.py) ===")
+        logger.info("=== URL Discovery Summary ===")
         for entry in discovery_log:
-            logger.info(f"  {entry['school']}:")
-            logger.info(f"    old: {entry['old_url']}")
+            logger.info(f"  {entry['school']}: old={entry['old_url']}")
             for c in entry["candidates"]:
-                logger.info(f"    → score={c['score']}  {c['url']}")
+                tag = " (auto-accepted)" if entry["school"] in new_discoveries else ""
+                logger.info(f"    → score={c['score']}  {c['url']}{tag}")
 
     return results

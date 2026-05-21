@@ -2,9 +2,8 @@ name: Weekly Econ Project Sync
 
 on:
   schedule:
-    # Runs every Monday at 08:00 UTC
     - cron: "0 8 * * 1"
-  workflow_dispatch:   # Allow manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -16,6 +15,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Restore discovered URLs cache
+        uses: actions/cache@v4
+        with:
+          path: data/discovered_urls.json
+          key: discovered-urls-${{ github.run_id }}
+          restore-keys: |
+            discovered-urls-
 
       - name: Set up Python
         uses: actions/setup-python@v5
