@@ -16,6 +16,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Restore last week records cache
+        uses: actions/cache@v4
+        with:
+          path: data/last_week_records.json
+          key: last-week-records-${{ github.run_id }}
+          restore-keys: |
+            last-week-records-
+
       - name: Restore discovered URLs cache
         uses: actions/cache@v4
         with:

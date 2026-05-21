@@ -87,6 +87,7 @@ class SlackBot:
         self.socket: Optional[SocketModeClient] = None
         self.notion = notion_client
         self._httpx: Optional[httpx.AsyncClient] = None
+        self._seen_events: set[str] = set()  # dedup event_ts
 
     async def _get_httpx(self) -> httpx.AsyncClient:
         if self._httpx is None:
@@ -110,6 +111,14 @@ class SlackBot:
         event = req.payload.get("event", {})
         if event.get("type") != "app_mention":
             return
+
+        event_ts = event.get("ts", "")
+        if event_ts in self._seen_events:
+            return
+        self._seen_events.add(event_ts)
+        # Keep set bounded
+        if len(self._seen_events) > 200:
+            self._seen_events.clear()
 
         channel = event.get("channel", "")
         user = event.get("user", "")
