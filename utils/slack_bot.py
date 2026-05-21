@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from slack_sdk.socket_mode.async_client import AsyncSocketModeClient
+from slack_sdk.socket_mode.aiohttp import SocketModeClient
 from slack_sdk.web.async_client import AsyncWebClient
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, AGENT_MODEL
@@ -81,8 +81,10 @@ SYSTEM_PROMPT = (Path(__file__).resolve().parent.parent / "prompts" / "slack_bot
 
 class SlackBot:
     def __init__(self, bot_token: str, app_token: str, notion_client: "NotionSync" = None):
-        self.web = AsyncWebClient(token=bot_token)
-        self.socket = AsyncSocketModeClient(app_token=app_token, web_client=self.web)
+        self.bot_token = bot_token
+        self.app_token = app_token
+        self.web: Optional[AsyncWebClient] = None
+        self.socket: Optional[SocketModeClient] = None
         self.notion = notion_client
         self._httpx: Optional[httpx.AsyncClient] = None
 
@@ -94,16 +96,18 @@ class SlackBot:
     # ── Message handling ─────────────────────────────────────────────
 
     async def start(self):
+        self.web = AsyncWebClient(token=self.bot_token)
+        self.socket = SocketModeClient(app_token=self.app_token, web_client=self.web)
         self.socket.socket_mode_request_listeners.append(self._on_message)
         await self.socket.connect()
         logger.info("Slack Bot connected (Socket Mode)")
-        await self.socket._event_loop  # keep alive
+        await asyncio.Event().wait()  # keep alive forever
 
-    async def _on_message(self, client: AsyncSocketModeClient, req: dict):
-        if req.get("type") != "events_api":
+    async def _on_message(self, client: AsyncWebClient, req):
+        if req.type != "events_api":
             return
 
-        event = req.get("payload", {}).get("event", {})
+        event = req.payload.get("event", {})
         if event.get("type") != "app_mention":
             return
 
